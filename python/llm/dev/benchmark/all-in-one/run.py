@@ -21,6 +21,7 @@ import time
 import gc
 import traceback
 import threading
+import csv
 
 import numpy as np
 from datetime import date
@@ -62,31 +63,31 @@ def run_model_in_thread(model, in_out, tokenizer, result, warm_up, num_beams, in
             result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
                                    actual_in_len, actual_out_len, model.peak_memory])
 
-def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, num_trials=3, num_beams=1, low_bit='sym_int4', cpu_embedding=False):
+def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, num_trials=3, num_beams=1, low_bit='sym_int4', cpu_embedding=False, batch_size=1):
     # TODO: make a parameter
     result= {}
     if test_api == 'transformer_int4':
-        result = run_transformer_int4(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit)
+        result = run_transformer_int4(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'native_int4':
         run_native_int4(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials)
     elif test_api == 'optimize_model':
-        result = run_optimize_model(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit)
+        result = run_optimize_model(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'transformer_int4_gpu':
-        result = run_transformer_int4_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit)
+        result = run_transformer_int4_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'optimize_model_gpu':
-        result = run_optimize_model_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit)
+        result = run_optimize_model_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'pytorch_autocast_bf16':
-        result = run_pytorch_autocast_bf16(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams)
+        result = run_pytorch_autocast_bf16(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
     elif test_api == 'ipex_fp16_gpu':
-        result = run_ipex_fp16_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams)
+        result = run_ipex_fp16_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
     elif test_api == "bigdl_fp16_gpu":
-        result = result = run_bigdl_fp16_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams)
+        result = result = run_bigdl_fp16_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
     elif test_api == 'deepspeed_transformer_int4_cpu':
-        result = run_deepspeed_transformer_int4_cpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit)
+        result = run_deepspeed_transformer_int4_cpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'transformer_int4_gpu_win':
-        result = run_transformer_int4_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding)
+        result = run_transformer_int4_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size)
     elif test_api == 'transformer_autocast_bf16':
-        result = run_transformer_autocast_bf16(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams)
+        result = run_transformer_autocast_bf16(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
 
     for in_out_pair in in_out_pairs:
         if result and result[in_out_pair]:
@@ -159,7 +160,8 @@ def run_transformer_int4(repo_id,
                          warm_up,
                          num_trials,
                          num_beams,
-                         low_bit):
+                         low_bit,
+                         batch_size):
     from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, LlamaTokenizer
 
@@ -201,7 +203,8 @@ def run_transformer_int4(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt")
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -223,7 +226,8 @@ def run_pytorch_autocast_bf16(repo_id,
                          in_out_pairs,
                          warm_up,
                          num_trials,
-                         num_beams):
+                         num_beams,
+                         batch_size):
     from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, LlamaTokenizer
 
     model_path = get_model_path(repo_id, local_model_hub)
@@ -263,7 +267,8 @@ def run_pytorch_autocast_bf16(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt")
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             print("input tokens: {}".format(input_ids.shape[1]))
@@ -287,7 +292,8 @@ def run_optimize_model(repo_id,
                        warm_up,
                        num_trials,
                        num_beams,
-                       low_bit):
+                       low_bit,
+                       batch_size):
     from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
     from bigdl.llm import optimize_model
 
@@ -331,7 +337,8 @@ def run_optimize_model(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt")
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -355,7 +362,8 @@ def run_transformer_int4_gpu(repo_id,
                              warm_up,
                              num_trials,
                              num_beams,
-                             low_bit):
+                             low_bit,
+                             batch_size):
     from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
     import intel_extension_for_pytorch as ipex
@@ -418,12 +426,28 @@ def run_transformer_int4_gpu(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt").to('xpu')
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to('xpu')
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             thread = threading.Thread(target=run_model_in_thread, args=(model, in_out, tokenizer, result, warm_up, num_beams, input_ids, out_len, actual_in_len, num_trials))
             thread.start()
             thread.join()
+
+            if result[in_out]:
+                first_token_latency = round(np.mean(result[in_out], axis=0)[0]*1000.0, 2)
+                rest_token_latency = round(np.mean(result[in_out], axis=0)[1]*1000.0, 2)
+                encoder_time = round(np.mean(result[in_out], axis=0)[2]*1000.0, 2)
+                input_output_tokens = in_out
+                actual_input_output_tokens = f'{int(np.mean(result[in_out], axis=0)[3])}' + f'-{int(np.mean(result[in_out], axis=0)[4])}'
+                peak_mem = result[in_out][-1][5]
+                with open(csv_name, mode='a', newline='') as file:
+                    csv_writer = csv.writer(file)
+                    file.seek(0, os.SEEK_END)
+                    if file.tell() == 0:
+                        csv_writer.writerow(["","model","1st token avg latency (ms)","2+ avg latency (ms/token)","encoder time (ms)","input/output tokens","actual input/output tokens","num_beams","low_bit","cpu_embedding","peak mem (GB)"])
+                    csv_writer.writerow(['', repo_id, first_token_latency, rest_token_latency, encoder_time, input_output_tokens, actual_input_output_tokens, num_beams, low_bit, '', peak_mem])
+
     model.to('cpu')
     torch.xpu.synchronize()
     torch.xpu.empty_cache()
@@ -431,14 +455,14 @@ def run_transformer_int4_gpu(repo_id,
     gc.collect()
     return result
 
-
 def run_optimize_model_gpu(repo_id,
                            local_model_hub,
                            in_out_pairs,
                            warm_up,
                            num_trials,
                            num_beams,
-                           low_bit):
+                           low_bit,
+                           batch_size):
     from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
     from bigdl.llm import optimize_model
     import intel_extension_for_pytorch as ipex
@@ -490,7 +514,8 @@ def run_optimize_model_gpu(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt").to('xpu')
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to('xpu')
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -517,7 +542,8 @@ def run_ipex_fp16_gpu(repo_id,
                       in_out_pairs,
                       warm_up,
                       num_trials,
-                      num_beams):
+                      num_beams,
+                      batch_size):
     from transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
     import intel_extension_for_pytorch as ipex
@@ -562,7 +588,8 @@ def run_ipex_fp16_gpu(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt").to('xpu')
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to('xpu')
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -589,7 +616,8 @@ def run_bigdl_fp16_gpu(repo_id,
                        in_out_pairs,
                        warm_up,
                        num_trials,
-                       num_beams):
+                       num_beams,
+                       batch_size):
     from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
     import intel_extension_for_pytorch as ipex
@@ -637,7 +665,8 @@ def run_bigdl_fp16_gpu(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt").to('xpu')
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to('xpu')
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -664,7 +693,8 @@ def run_deepspeed_transformer_int4_cpu(repo_id,
                          warm_up,
                          num_trials,
                          num_beams,
-                         low_bit):
+                         low_bit,
+                         batch_size):
     from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer
     import deepspeed
     from bigdl.llm import optimize_model
@@ -726,7 +756,8 @@ def run_deepspeed_transformer_int4_cpu(repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt")
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -753,7 +784,8 @@ def run_transformer_int4_gpu_win(repo_id,
                                  num_trials,
                                  num_beams,
                                  low_bit,
-                                 cpu_embedding):
+                                 cpu_embedding,
+                                 batch_size):
     from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
     import intel_extension_for_pytorch as ipex
@@ -811,7 +843,8 @@ def run_transformer_int4_gpu_win(repo_id,
                 input_ids = tokenizer.encode(input_str, return_tensors="pt")
                 input_ids = input_ids[:, :in_len]
                 true_str = tokenizer.batch_decode(input_ids)[0]
-                input_ids = tokenizer.encode(true_str, return_tensors="pt").to('xpu')
+                input_list = [true_str] * batch_size
+                input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to('xpu')
                 actual_in_len = input_ids.shape[1]
                 result[in_out] = []
                 for i in range(num_trials + warm_up):
@@ -844,7 +877,8 @@ def run_transformer_autocast_bf16( repo_id,
                     in_out_pairs,
                     warm_up,
                     num_trials,
-                    num_beams):
+                    num_beams,
+                    batch_size):
     from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, LlamaTokenizer
 
@@ -887,7 +921,8 @@ def run_transformer_autocast_bf16( repo_id,
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
             input_ids = input_ids[:, :in_len]
             true_str = tokenizer.batch_decode(input_ids)[0]
-            input_ids = tokenizer.encode(true_str, return_tensors="pt")
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
             actual_in_len = input_ids.shape[1]
             result[in_out] = []
             for i in range(num_trials + warm_up):
@@ -913,6 +948,8 @@ if __name__ == '__main__':
     
     import pandas as pd
     for api in conf.test_api:
+        global csv_name
+        csv_name = f'{current_dir}/{api}-results-{today}.csv'
         for model in conf.repo_id:
             in_out_pairs = conf['in_out_pairs'].copy()
             if excludes:
@@ -921,10 +958,9 @@ if __name__ == '__main__':
                     if model_id_input in excludes:
                         in_out_pairs.remove(in_out)
             run_model(model, api, in_out_pairs, conf['local_model_hub'], conf['warm_up'], conf['num_trials'], conf['num_beams'],
-                      conf['low_bit'], conf['cpu_embedding'])
+                      conf['low_bit'], conf['cpu_embedding'], conf['batch_size'])
         df = pd.DataFrame(results, columns=['model', '1st token avg latency (ms)', '2+ avg latency (ms/token)', 'encoder time (ms)',
-                                            'input/output tokens', 'actual input/output tokens', 'num_beams', 'low_bit', 'cpu_embedding', 
+                                            'input/output tokens', 'actual input/output tokens', 'num_beams', 'low_bit', 'cpu_embedding',
                                             'peak mem (GB)'])
-
-        df.to_csv(f'{current_dir}/{api}-results-{today}.csv')
+        df.to_csv(csv_name)
         results = []

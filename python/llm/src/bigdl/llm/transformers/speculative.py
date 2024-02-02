@@ -57,7 +57,8 @@ def generate(
         new_speculative_kwargs = {}
         for var in ['max_new_tokens', 'max_step_draft', 'th_stop_draft', 'do_sample',
                     'top_k', 'top_p', 'temperature', 'hf_adjust',
-                    'auto_th_stop_draft', 'auto_parameters']:
+                    'auto_th_stop_draft', 'auto_parameters', 'repetition_penalty',
+                    'attention_mask']:
             value = kwargs.pop(var, None)
             if value is not None:
                 new_speculative_kwargs[var] = value
@@ -79,29 +80,41 @@ def generate(
 GenerationMixin.generate = generate
 
 
-def sample(logits, return_probs: bool=False, do_sample: bool=False, top_k: int=50,
-           top_p: float=0.7, temperature: float=0.7):
-
+def greedy(logits, return_probs: bool=False):
     if return_probs:
         all_probs = logits.softmax(-1)
-        if do_sample and top_k != 1 and top_p != 0.0 and temperature != 0.0:
-            _logits = top_k_top_p_filtering(logits.view(-1, logits.size(-1)) / temperature,
-                                            top_k=top_k, top_p=top_p)
-            output_ids = torch.multinomial(_logits.softmax(-1),
-                                           num_samples=1).view(logits.shape[:-1])
-            probs = torch.gather(all_probs, -1, output_ids.unsqueeze(-1)).squeeze(-1)
-        else:
-            probs, output_ids = torch.max(all_probs, dim=-1)
+        probs, output_ids = torch.max(all_probs, dim=-1)
         return output_ids, probs
     else:
-        if do_sample and top_k != 1 and top_p != 0.0 and temperature != 0.0:
-            _logits = top_k_top_p_filtering(logits.view(-1, logits.size(-1)) / temperature,
-                                            top_k=top_k, top_p=top_p)
-            output_ids = torch.multinomial(_logits.softmax(-1),
-                                           num_samples=1).view(logits.shape[:-1])
-        else:
-            output_ids = torch.argmax(logits, dim=-1)
+        output_ids = torch.argmax(logits, dim=-1)
         return output_ids
+
+
+def deepmind_sample(logits, return_probs: bool=False, top_k: int=50,
+                    top_p: float=0.7, temperature: float=0.7):
+    prob_list = logits_to_probs(logits, top_k=top_k, top_p=top_p, temperature=temperature)
+    output_ids = multinomial_sample_one_no_sync(prob_list)
+    if return_probs:
+        all_probs = logits.softmax(-1)
+        probs = torch.gather(all_probs, -1, output_ids.unsqueeze(-1)).squeeze(-1)
+        return output_ids, prob_list, probs
+    else:
+        return output_ids, prob_list
+
+
+def logits_to_probs(logits, top_k: int=50, top_p: float=0.7, temperature: float=0.7):
+    invalidInputError(top_k != 1 and top_p != 0.0 and temperature != 0.0,
+                      "top_k != 1 and top_p != 0.0 and temperature != 0.0 if do_sample=True")
+    _logits = top_k_top_p_filtering(logits.view(-1, logits.size(-1)) / temperature,
+                                    top_k=top_k, top_p=top_p)
+    prob_list = _logits.softmax(-1)
+
+    return prob_list
+
+
+def multinomial_sample_one_no_sync(probs_sort):
+    q = torch.empty_like(probs_sort).exponential_(1)
+    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int64)
 
 
 def clear_benchmarks(self):
@@ -115,6 +128,133 @@ def clear_benchmarks(self):
     self.n_matched = 0
 
 
+def _prepare_past_key_values_storage_cpu(self, past_key_values,
+                                         max_new_tokens, _enable_ipex=False):
+    past_key_values_storage = []
+    if _enable_ipex:
+        ipex_past_key_values = []
+        cur_len = past_key_values[0][0].size(1)
+        ipex_past_key_values = [
+            [pkv[1].permute(1, 2, 0, 3)[:, :, :cur_len, :],
+                pkv[2].permute(1, 2, 0, 3)[:, :, :cur_len, :]]
+            for pkv in past_key_values
+        ]
+
+    for i in range(len(past_key_values)):
+        if not _enable_ipex:
+            len0 = past_key_values[i][0].size(0)
+            len1 = past_key_values[i][0].size(1)
+            len2 = past_key_values[i][0].size(2)
+            len3 = past_key_values[i][0].size(3)
+        else:
+            len0 = past_key_values[i][1].size(1)
+            len1 = past_key_values[i][1].size(2)
+            len2 = past_key_values[i][0].size(2)  # seq length
+            len3 = past_key_values[i][1].size(3)
+        if self.config.model_type == "qwen":
+            k0 = torch.ones(len0, len2, len1 + max_new_tokens, len3,
+                            dtype=torch.float32)
+            v0 = torch.ones(len0, len2, len1 + max_new_tokens, len3,
+                            dtype=torch.float32)
+            k0 = k0.transpose(1, 2)
+            v0 = v0.transpose(1, 2)
+            past_key_values_storage.append((k0, v0))
+            past_key_values_storage[i][0][:, :len1, :, :] = past_key_values[i][0].to(
+                torch.float32)
+            past_key_values_storage[i][1][:, :len1, :, :] = past_key_values[i][1].to(
+                torch.float32)
+        elif self.config.model_type == "chatglm":
+            k0 = torch.ones(len1, len2, len0 + max_new_tokens, len3,
+                            dtype=torch.float32)
+            v0 = torch.ones(len1, len2, len0 + max_new_tokens, len3,
+                            dtype=torch.float32)
+            k0 = k0.permute(2, 0, 1, 3)
+            v0 = v0.permute(2, 0, 1, 3)
+            past_key_values_storage.append((k0, v0))
+            past_key_values_storage[i][0][:len0, :, :, :] = past_key_values[i][0].to(
+                torch.float32)
+            past_key_values_storage[i][1][:len0, :, :, :] = past_key_values[i][1].to(
+                torch.float32)
+        else:
+            k0 = torch.ones(len0, len1, len2 + max_new_tokens, len3,
+                            dtype=torch.float32)
+            v0 = torch.ones(len0, len1, len2 + max_new_tokens, len3,
+                            dtype=torch.float32)
+            past_key_values_storage.append((k0, v0))
+            if not _enable_ipex:
+                past_key_values_storage[i][0][:, :, :len2, :] = past_key_values[i][0].to(
+                    torch.float32)
+                past_key_values_storage[i][1][:, :, :len2, :] = past_key_values[i][1].to(
+                    torch.float32)
+            else:
+                past_key_values_storage[i][0][:, :, :len2, :] = ipex_past_key_values[i][0].to(
+                    torch.float32)
+                past_key_values_storage[i][1][:, :, :len2, :] = ipex_past_key_values[i][1].to(
+                    torch.float32)
+
+    return past_key_values_storage
+
+
+def _prepare_draft_past_key_values_cpu(self, past_key_values, past_key_values_storage):
+    tmp_past_key_values = []
+    for i in range(len(past_key_values)):
+        if self.config.model_type == "qwen":
+            len1 = past_key_values[0][0].size(1)
+            k0 = past_key_values_storage[i][0][:, :len1, :, :]
+            v0 = past_key_values_storage[i][1][:, :len1, :, :]
+            tmp_past_key_values.append((k0, v0))
+        elif self.config.model_type == "chatglm":
+            len0 = past_key_values[0][0].size(0)
+            k0 = past_key_values_storage[i][0][:len0, :, :, :]
+            v0 = past_key_values_storage[i][1][:len0, :, :, :]
+            tmp_past_key_values.append((k0, v0))
+        else:
+            len2 = past_key_values[0][0].size(2)
+            k0 = past_key_values_storage[i][0][:, :, :len2, :]
+            v0 = past_key_values_storage[i][1][:, :, :len2, :]
+            tmp_past_key_values.append((k0, v0))
+    return tmp_past_key_values
+
+
+def _update_past_key_values_storage_cpu(self, past_key_values, past_key_values_storage,
+                                        original_draft_past_key_values, _enable_ipex=False):
+    for i in range(len(past_key_values)):
+        if not _enable_ipex:
+            if self.config.model_type == "qwen":
+                size = original_draft_past_key_values[i][0].size(1)
+                size1 = past_key_values[i][0].size(1)
+                past_key_values_storage[i][0][:, size:size1, :, :] = \
+                    past_key_values[i][0][:, size:size1, :, :].to(torch.float32)
+                past_key_values_storage[i][1][:, size:size1, :, :] = \
+                    past_key_values[i][1][:, size:size1, :, :].to(torch.float32)
+            elif self.config.model_type == "chatglm":
+                size = original_draft_past_key_values[i][0].size(0)
+                size1 = past_key_values[i][0].size(0)
+                past_key_values_storage[i][0][size:size1, :, :, :] = \
+                    past_key_values[i][0][size:size1, :, :, :].to(torch.float32)
+                past_key_values_storage[i][1][size:size1, :, :, :] = \
+                    past_key_values[i][1][size:size1, :, :, :].to(torch.float32)
+            else:
+                size = original_draft_past_key_values[i][0].size(2)
+                size1 = past_key_values[i][0].size(2)
+                past_key_values_storage[i][0][:, :, size:size1, :] = \
+                    past_key_values[i][0][:, :, size:size1, :].to(torch.float32)
+                past_key_values_storage[i][1][:, :, size:size1, :] = \
+                    past_key_values[i][1][:, :, size:size1, :].to(torch.float32)
+        else:
+            size = original_draft_past_key_values[i][0].size(2)
+            size1 = past_key_values[i][0].size(1)
+            delta_past_key = \
+                past_key_values[i][1][size:size1, :, :, :].permute(1, 2, 0, 3)
+            delta_past_value = \
+                past_key_values[i][2][size:size1, :, :, :].permute(1, 2, 0, 3)
+
+            past_key_values_storage[i][0][:, :, size:size1, :] = \
+                delta_past_key.to(torch.float32)
+            past_key_values_storage[i][1][:, :, size:size1, :] = \
+                delta_past_value.to(torch.float32)
+
+
 @torch.no_grad()
 def speculative_generate(self,
                          inputs: Optional[torch.Tensor] = None,
@@ -126,31 +266,12 @@ def speculative_generate(self,
                          auto_parameters=[1, 0.5, 0.9, 1e-2, 0.9],
                          hf_adjust=False,
                          generation_config: Optional[GenerationConfig] = None,
+                         attention_mask=None,
                          **sampling_kwargs):
     invalidInputError(draft_model is not None,
                       "Draft model should be provided.")
 
     if generation_config is None:
-        # legacy: users may modify the model configuration to control generation.
-        # To trigger this legacy behavior, two conditions must be met
-        # 1) the generation config must have been created from the
-        # model config (`_from_model_config` field);
-        # 2) the generation config must have seen no modification
-        # since its creation (the hash is the same).
-        if self.generation_config._from_model_config \
-            and self.generation_config._original_object_hash == hash(
-                self.generation_config):
-            new_generation_config = GenerationConfig.from_model_config(self.config)
-            if new_generation_config != self.generation_config:
-                warnings.warn(
-                    "You have modified the pretrained model configuration to control "
-                    "generation. This is a deprecated strategy to control generation "
-                    "and will be removed soon, in a future version. Please use and "
-                    "modify the model generation configuration (see"
-                    " https://huggingface.co/docs/transformers/generation_strategies"
-                    "#default-text-generation-configuration )"
-                )
-                self.generation_config = new_generation_config
         generation_config = self.generation_config
 
     generation_config = copy.deepcopy(generation_config)
@@ -245,6 +366,16 @@ def speculative_generate(self,
     draft_generate_ids = torch.empty([input_ids.size(0), draft_gen_length],
                                      dtype=torch.long, device=self.device)
     past_key_values = None
+    past_key_values_storage = []
+
+    _enable_ipex = os.getenv("BIGDL_OPT_IPEX")
+    _enable_ipex = (_enable_ipex is not None) and (_enable_ipex.lower() == "true")
+    if _enable_ipex:
+        if not ((self.config.model_type == 'baichuan' and self.config.hidden_size == 5120) or
+                ('llama' in self.config.model_type) or
+                ("mistral" in self.config.model_type)):
+            invalidInputError(False, "BigDL Speculative Decoding with IPEX BF16 only supports \
+                                      Llama, Baichuan2-13b and Mistral models currently.")
 
     tmp_matchness = 0
     e2e_tic = 0.0
@@ -271,14 +402,19 @@ def speculative_generate(self,
             tic = time.time()
             output = self(input_ids=current_input_ids,
                           past_key_values=past_key_values,
+                          attention_mask=attention_mask,
                           return_dict=True,
                           use_cache=True)
             logits = output['logits']
             logits = logits[:, -1:]
             logits[:, -1, :] = logits_processor(current_input_ids, logits[:, -1, :])
-            output_ids = sample(logits, do_sample=generation_config.do_sample,
-                                top_k=generation_config.top_k, top_p=generation_config.top_p,
-                                temperature=generation_config.temperature)
+            if generation_config.do_sample:
+                output_ids, prob_list = deepmind_sample(logits,
+                                                        top_k=generation_config.top_k,
+                                                        top_p=generation_config.top_p,
+                                                        temperature=generation_config.temperature)
+            else:
+                output_ids = greedy(logits)
             generate_ids[:, step] = output_ids
             current_input_ids = output_ids
             past_key_values = output['past_key_values']
@@ -291,23 +427,48 @@ def speculative_generate(self,
         else:
             draft_current_input_ids = current_input_ids
             # Target model KV cache to draft model
-            draft_past_key_values = past_key_values
+
+            if self.device.type == 'cpu':
+                # init past_key_values_storage and assign initial fp32 value
+                if step == 1:
+                    past_key_values_storage = \
+                        _prepare_past_key_values_storage_cpu(self, past_key_values,
+                                                             max_new_tokens, _enable_ipex)
+                # each iter cut off cur_len kv_cache from past_key_values1
+                draft_past_key_values = \
+                    _prepare_draft_past_key_values_cpu(self, past_key_values,
+                                                       past_key_values_storage)
+                original_draft_past_key_values = draft_past_key_values
+            else:
+                draft_past_key_values = past_key_values
             draft_generate_ids[:, 0] = current_input_ids
+            draft_prob_list = []
             tic = time.time()
+            random_probs = None
+            if generation_config.do_sample:
+                random_probs = torch.rand(max_step_draft, device=self.device, dtype=self.dtype)
             # Draft model auto-regressively generate k tokens
             # Early stop when prob less then th_stop_draft
             for step_draft in range(max_step_draft):
+                if attention_mask is None:
+                    draft_attention_mask = None
+                else:
+                    appended_len = step_draft + step
+                    ones_to_append = torch.ones(attention_mask.size(0), appended_len)
+                    draft_attention_mask = torch.cat((attention_mask, ones_to_append), dim=1)
                 if self.config.model_type == "chatglm":
                     past_key_value_len = past_key_values[0][0].shape[0]
                     position_ids = torch.Tensor([[past_key_value_len + step_draft]]).long()
                     draft_output = draft_model(input_ids=draft_current_input_ids,
                                                past_key_values=draft_past_key_values,
+                                               attention_mask=draft_attention_mask,
                                                return_dict=True,
                                                use_cache=True,
                                                position_ids=position_ids)
                 else:
                     draft_output = draft_model(input_ids=draft_current_input_ids,
                                                past_key_values=draft_past_key_values,
+                                               attention_mask=draft_attention_mask,
                                                return_dict=True,
                                                use_cache=True)
                 temp_input_ids = torch.cat((input_ids, generate_ids[:, :step],
@@ -315,19 +476,25 @@ def speculative_generate(self,
                 logits = draft_output['logits']
                 logits[:, -1, :] = logits_processor(temp_input_ids,
                                                     draft_output['logits'][:, -1, :])
-                draft_output_ids, draft_output_probs = sample(
-                    logits,
-                    return_probs=True,
-                    do_sample=generation_config.do_sample,
-                    top_k=generation_config.top_k,
-                    top_p=generation_config.top_p,
-                    temperature=generation_config.temperature)
+                if generation_config.do_sample:
+                    draft_output_ids, draft_probs, draft_output_probs = deepmind_sample(
+                        logits,
+                        return_probs=True,
+                        top_k=generation_config.top_k,
+                        top_p=generation_config.top_p,
+                        temperature=generation_config.temperature)
+                    draft_prob_list.append(draft_probs)
+                else:
+                    draft_output_ids, draft_output_probs = greedy(
+                        logits,
+                        return_probs=True)
                 draft_generate_ids[:, step_draft+1] = draft_output_ids
                 draft_current_input_ids = draft_output_ids
                 draft_past_key_values = draft_output['past_key_values']
                 # check if draft prob is less then th_stop_draft
                 # Draft number + step >= max output token number
-                if draft_output_probs.item() < th_stop_draft or \
+                th_random = 1 if random_probs is None else random_probs[step_draft]
+                if (draft_output_probs.item() < th_stop_draft and th_random > 0.3) or \
                         step + step_draft + 2 >= max_new_tokens:
                     break
             if self.device.type == 'xpu':
@@ -343,30 +510,76 @@ def speculative_generate(self,
             # input.size is k + 1, 1 previous token + k drafts
             # verified output.size is k + 1, k token + 1 final
             # Final token is always accepted
-            if self.config.model_type == "chatglm":
-                past_key_value_len = past_key_values[0][0].shape[0]
-                position_ids = torch.arange(drafted_input_ids.shape[1], dtype=torch.long,
-                                            device=drafted_input_ids.device)
-                position_ids = position_ids.unsqueeze(0).repeat(1, 1) + past_key_value_len
-                output = self(input_ids=drafted_input_ids,
-                              past_key_values=past_key_values,
-                              return_dict=True,
-                              use_cache=True,
-                              position_ids=position_ids)
+            if attention_mask is None:
+                cur_attention_mask = None
             else:
-                output = self(input_ids=drafted_input_ids,
-                              past_key_values=past_key_values,
-                              return_dict=True,
-                              use_cache=True)
-            logits = output['logits']
+                appended_len = drafted_input_ids.size(1) + step - 1
+                ones_to_append = torch.ones(attention_mask.size(0), appended_len)
+                cur_attention_mask = torch.cat((attention_mask, ones_to_append), dim=1)
+            if _enable_ipex and hasattr(self, "trace_graph"):
+                if self.config.model_type == "baichuan":
+                    output = self.trace_graph(input_ids=drafted_input_ids,
+                                              attention_mask=cur_attention_mask,
+                                              past_key_values=past_key_values,
+                                              )
+                elif "llama" in self.config.model_type:
+                    past_key_value_len = past_key_values[0][0].shape[2]
+                    position_ids = torch.arange(drafted_input_ids.shape[1], dtype=torch.long,
+                                                device=drafted_input_ids.device).unsqueeze(0)
+                    position_ids = position_ids.repeat(1, 1) + past_key_value_len
+                    output = self.trace_graph(input_ids=drafted_input_ids,
+                                              attention_mask=cur_attention_mask,
+                                              position_ids=position_ids,
+                                              past_key_values=past_key_values,
+                                              )
+                elif "mistral" in self.config.model_type:
+                    past_key_value_len = past_key_values[0][0].shape[2]
+                    seq_len = drafted_input_ids.shape[1]
+                    position_ids = torch.arange(past_key_value_len,
+                                                seq_len + past_key_value_len,
+                                                dtype=torch.long,
+                                                device=drafted_input_ids.device)
+                    position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
+                    output = self.trace_graph(input_ids=drafted_input_ids,
+                                              attention_mask=cur_attention_mask,
+                                              past_key_values=past_key_values,
+                                              position_ids=position_ids,
+                                              )
+                logits = output[0]
+                past_key_values = output[1]
+            else:
+                if self.config.model_type == "chatglm":
+                    past_key_value_len = past_key_values[0][0].shape[0]
+                    position_ids = torch.arange(drafted_input_ids.shape[1], dtype=torch.long,
+                                                device=drafted_input_ids.device)
+                    position_ids = position_ids.unsqueeze(0).repeat(1, 1) + past_key_value_len
+                    output = self(input_ids=drafted_input_ids,
+                                  past_key_values=past_key_values,
+                                  attention_mask=cur_attention_mask,
+                                  return_dict=True,
+                                  use_cache=True,
+                                  position_ids=position_ids)
+                else:
+                    output = self(input_ids=drafted_input_ids,
+                                  past_key_values=past_key_values,
+                                  attention_mask=cur_attention_mask,
+                                  return_dict=True,
+                                  use_cache=True)
+            if isinstance(output, dict):
+                logits = output['logits']
+                past_key_values = output['past_key_values']
             temp_input_ids = torch.cat((input_ids, generate_ids[:, :step],
                                         draft_generate_ids[:, 1:step_draft + 2]), dim=-1)
             for i in range(logits.size(1)):
                 logits[:, i, :] = logits_processor(temp_input_ids[:, :input_ids.size(1)+step+i],
-                                                   output['logits'][:, i, :])
-            output_ids = sample(logits, do_sample=generation_config.do_sample,
-                                top_k=generation_config.top_k, top_p=generation_config.top_p,
-                                temperature=generation_config.temperature)
+                                                   logits[:, i, :])
+            if generation_config.do_sample:
+                target_probs = logits_to_probs(logits,
+                                               top_k=generation_config.top_k,
+                                               top_p=generation_config.top_p,
+                                               temperature=generation_config.temperature)
+            else:
+                output_ids = greedy(logits)
             if self.device.type == 'xpu':
                 torch.xpu.synchronize()
             toc = time.time()
@@ -374,12 +587,42 @@ def speculative_generate(self,
             self.generate_time.append(self.draft_time[-1] + self.verify_time[-1])
 
             past_key_values = output['past_key_values']
-            # Compare drafts with target verified outputs
-            # Drafts start from [1, k]
-            # Verified output start from [0, k - 1]
-            # including the one generated by the base model
-            max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0)
-            max_matched = max_matched.sum(-1).item() + 1
+
+            if generation_config.do_sample:
+                draft_tokens = drafted_input_ids[:, 1:].squeeze(0)
+                draft_probs = torch.stack(draft_prob_list).squeeze((1, 2))
+
+                # q: target prob, p: draft prob
+                # q >= p: always accept draft token
+                # q < p: q/p prob to accept draft token
+                p = draft_probs[torch.arange(0, drafted_n_tokens), draft_tokens]
+                q = target_probs[torch.arange(0, drafted_n_tokens), draft_tokens]
+                accept_draft_prob = torch.minimum(torch.ones(()), q[:drafted_n_tokens] / p)
+                rejected_locations = (random_probs[:drafted_n_tokens] > accept_draft_prob).nonzero()
+
+                if rejected_locations.shape[0] == 0:    # All draft tokens have been accepted
+                    max_matched = drafted_n_tokens + 1
+                    last_token = multinomial_sample_one_no_sync(target_probs[-1])
+                    output_ids = torch.cat([draft_tokens, last_token])
+                else:
+                    max_matched = rejected_locations[0].item()
+                    p = draft_probs[max_matched]
+                    q = target_probs[max_matched]
+                    resample_prob = q - p
+                    resample_prob = torch.where(resample_prob > 0, resample_prob, 0.0)
+                    resample_prob = resample_prob / resample_prob.sum()
+                    next_token = multinomial_sample_one_no_sync(resample_prob)
+                    output_ids = torch.cat([draft_tokens[:max_matched], next_token])
+                    max_matched += 1
+                output_ids = output_ids.unsqueeze(0)
+            else:
+                # Compare drafts with target verified outputs
+                # Drafts start from [1, k]
+                # Verified output start from [0, k - 1]
+                # including the one generated by the base model
+                max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0)
+                max_matched = max_matched.sum(-1).item() + 1
+
             max_of_max_matched = output_ids.size(1)
             # Accept number is max_matched, min is 1
             self.accept_num.append(max_matched)
@@ -387,30 +630,46 @@ def speculative_generate(self,
             if max_of_max_matched != max_matched:
                 output_ids = output_ids[:, :max_matched]
                 # For Qwen
-                if self.config.model_type == "qwen":
-                    past_key_values = [
-                        (k[:, :-(max_of_max_matched - max_matched), :],
-                         v[:, :-(max_of_max_matched - max_matched), :])
-                        for k, v in past_key_values
-                    ]
-                elif self.config.model_type == "chatglm":
-                    # for chatglm, cache shape is [sl, bs, nh, hn]
-                    past_key_values = [
-                        (k[:-(max_of_max_matched - max_matched), :, :, :],
-                         v[:-(max_of_max_matched - max_matched), :, :, :])
-                        for k, v in past_key_values
-                    ]
-                elif self.config.model_type == "baichuan":
-                    past_key_values = [
-                        (k[:, :, :-(max_of_max_matched - max_matched), :],
-                         v[:, :, :-(max_of_max_matched - max_matched), :])
-                        for k, v in past_key_values
-                    ]
+                if _enable_ipex:
+                    cur_len = past_key_values[0][0].size(1)
+                    delta = max_of_max_matched - max_matched
+                    tmp = torch.empty(1, (cur_len - delta), (cur_len - delta), 1,
+                                      dtype=torch.long,
+                                      ).contiguous()
+                    past_key_values = [[tmp, key_cache, value_cache, beam_idx]
+                                       for _, key_cache, value_cache, beam_idx in past_key_values]
                 else:
-                    past_key_values = [
-                        (k[:, :, :-(max_of_max_matched - max_matched)],
-                         v[:, :, :-(max_of_max_matched - max_matched)]) for k, v in past_key_values
-                    ]
+                    if self.config.model_type == "qwen":
+                        past_key_values = [
+                            (k[:, :-(max_of_max_matched - max_matched), :],
+                             v[:, :-(max_of_max_matched - max_matched), :])
+                            for k, v in past_key_values
+                        ]
+                    elif self.config.model_type == "chatglm":
+                        # for chatglm, cache shape is [sl, bs, nh, hn]
+                        past_key_values = [
+                            (k[:-(max_of_max_matched - max_matched), :, :, :],
+                             v[:-(max_of_max_matched - max_matched), :, :, :])
+                            for k, v in past_key_values
+                        ]
+                    elif self.config.model_type == "baichuan":
+                        past_key_values = [
+                            (k[:, :, :-(max_of_max_matched - max_matched), :],
+                             v[:, :, :-(max_of_max_matched - max_matched), :])
+                            for k, v in past_key_values
+                        ]
+                    else:
+                        past_key_values = [
+                            (k[:, :, :-(max_of_max_matched - max_matched)],
+                             v[:, :, :-(max_of_max_matched - max_matched)])
+                            for k, v in past_key_values
+                        ]
+
+            # Each iter assign new_matched kv_cache to past_key_values1
+            if self.device.type == 'cpu':
+                _update_past_key_values_storage_cpu(self, past_key_values, past_key_values_storage,
+                                                    original_draft_past_key_values,
+                                                    _enable_ipex)
 
             generate_ids[:, step:step+output_ids.size(1)] = output_ids
             current_input_ids = output_ids[:, -1:]

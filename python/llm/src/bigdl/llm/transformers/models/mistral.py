@@ -43,9 +43,9 @@ from torch import nn
 import torch.nn.functional as F
 from bigdl.llm.utils.common import invalidInputError
 from bigdl.llm.transformers.models.utils import init_kv_cache, extend_kv_cache, append_kv_cache
-from bigdl.llm.transformers.models.utils import apply_rotary_pos_emb,\
+from bigdl.llm.transformers.models.utils import apply_rotary_pos_emb, \
     apply_rotary_pos_emb_no_cache_xpu
-from bigdl.llm.transformers.models.utils import is_enough_kv_cache_room_4_31,\
+from bigdl.llm.transformers.models.utils import is_enough_kv_cache_room_4_31, \
     is_enough_kv_cache_room_4_36
 from bigdl.llm.transformers.low_bit_linear import SYM_INT4, FP8E5
 from bigdl.llm.transformers.models.utils import use_flash_attention
@@ -82,7 +82,7 @@ def use_decoding_fast_path(q_type, use_fuse_rope, enough_kv_room, bs):
 def compute_attn_outputs_weights(query_states, key_states, value_states, bsz, q_len, kv_seq_len,
                                  num_heads, head_dim, hidden_size, attention_mask):
     attn_weights = torch.matmul(
-        query_states,
+        query_states.to(key_states.dtype),
         key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
     if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
@@ -105,7 +105,7 @@ def compute_attn_outputs_weights(query_states, key_states, value_states, bsz, q_
     # upcast attention to fp32
     attn_weights = nn.functional.\
         softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = torch.matmul(attn_weights, value_states.to(query_states.dtype))
 
     if attn_output.size() != (bsz, num_heads, q_len, head_dim):
         invalidInputError(
